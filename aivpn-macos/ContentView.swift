@@ -8,6 +8,8 @@ struct ContentView: View {
     @State private var keyName: String = ""
     @State private var showKeyInput: Bool = false
     @AppStorage("fullTunnel") private var fullTunnel: Bool = false
+    @AppStorage("includedRoutesText") private var includedRoutesText: String = ""
+    @AppStorage("excludedRoutesText") private var excludedRoutesText: String = ""
     @State private var editingKeyId: String?
     @State private var editingKeyName: String = ""
     @State private var showDeleteConfirm = false
@@ -196,6 +198,28 @@ struct ContentView: View {
                             .help(loc.t("full_tunnel_help"))
                         Spacer()
                     }
+
+                    if fullTunnel {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Excluded routes (bypass VPN):")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            TextField("192.168.1.0/24, 10.0.0.0/8", text: $excludedRoutesText)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 10))
+                                .help("Comma-separated CIDRs — these subnets go via original gateway")
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Included routes (route via VPN):")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            TextField("192.168.1.0/24, 10.0.0.0/8", text: $includedRoutesText)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 10))
+                                .help("Comma-separated CIDRs — extra subnets routed through VPN")
+                        }
+                    }
                     
                     HStack(spacing: 8) {
                         Button(loc.t("cancel")) {
@@ -338,7 +362,16 @@ struct ContentView: View {
                     if !vpn.helperAvailable {
                         vpn.checkHelperAvailable()
                     } else {
-                        vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel)
+                        let included = includedRoutesText
+                            .split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                        let excluded = excludedRoutesText
+                            .split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                        vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
+                                    includedRoutes: included, excludedRoutes: excluded)
                     }
                 }
             }) {

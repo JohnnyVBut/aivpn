@@ -51,6 +51,14 @@ pub struct ClientArgs {
     #[arg(long, default_value_t = false)]
     pub full_tunnel: bool,
 
+    /// Extra subnets to route via VPN in split-tunnel mode (comma-separated CIDRs, e.g. 192.168.1.0/24,10.0.0.0/8)
+    #[arg(long, value_delimiter = ',')]
+    pub included_routes: Vec<String>,
+
+    /// Subnets to exclude from full-tunnel routing — sent via original gateway (comma-separated CIDRs)
+    #[arg(long, value_delimiter = ',')]
+    pub excluded_routes: Vec<String>,
+
     /// Config file path (JSON)
     #[arg(long)]
     pub config: Option<String>,
@@ -452,6 +460,8 @@ async fn main() {
                 tun_name.clone(),
                 network_config,
                 full_tunnel,
+                args.included_routes.clone(),
+                args.excluded_routes.clone(),
             ),
         };
 

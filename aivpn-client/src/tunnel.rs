@@ -27,6 +27,10 @@ pub struct TunnelConfig {
     pub mtu: u16,
     /// Route all traffic through VPN (full tunnel mode)
     pub full_tunnel: bool,
+    /// Extra subnets to route through VPN in split-tunnel mode (CIDR, e.g. "192.168.1.0/24")
+    pub included_routes: Vec<String>,
+    /// Subnets to exclude from full-tunnel routing — sent via original gateway (CIDR)
+    pub excluded_routes: Vec<String>,
 }
 
 impl Default for TunnelConfig {
@@ -40,6 +44,8 @@ impl Default for TunnelConfig {
             prefix_len: 24,
             mtu: WAN_SAFE_TUN_MTU,
             full_tunnel: false,
+            included_routes: Vec::new(),
+            excluded_routes: Vec::new(),
         }
     }
 }
@@ -49,6 +55,8 @@ impl TunnelConfig {
         tun_name: String,
         network_config: ClientNetworkConfig,
         full_tunnel: bool,
+        included_routes: Vec<String>,
+        excluded_routes: Vec<String>,
     ) -> Self {
         Self {
             tun_name,
@@ -58,6 +66,8 @@ impl TunnelConfig {
             prefix_len: network_config.prefix_len,
             mtu: network_config.mtu,
             full_tunnel,
+            included_routes,
+            excluded_routes,
         }
     }
 
@@ -115,6 +125,12 @@ pub struct Tunnel {
     /// Windows: wintun adapter interface index for explicit route binding.
     /// Without this, `route add` may bind VPN routes to the physical NIC.
     wintun_if_index: Option<String>,
+}
+
+/// Convert a CIDR prefix length to a dotted-decimal netmask string.
+fn prefix_to_netmask(prefix: u8) -> String {
+    let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+    format!("{}.{}.{}.{}", mask >> 24, (mask >> 16) & 0xff, (mask >> 8) & 0xff, mask & 0xff)
 }
 
 impl Tunnel {
@@ -372,6 +388,19 @@ impl Tunnel {
             info!("✓ Added subnet route {}/{} via {} (gateway {})", vpn_network_addr, self.config.prefix_len, tun_name, tun_addr);
         }
 
+        // Apply included routes (extra subnets via VPN in split-tunnel mode)
+        if !self.config.full_tunnel {
+            for cidr in self.config.included_routes.clone() {
+                let ok = Command::new("/sbin/route")
+                    .args(["-n", "add", "-net", &cidr, "-interface", tun_name])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok { info!("Added included route {} via {}", cidr, tun_name); }
+                else  { error!("Failed to add included route {}", cidr); }
+            }
+        }
+
         // Block IPv6 to prevent traffic leaks (IPv6 bypasses the IPv4-only VPN tunnel).
         // First, discover and save the current IPv6 default interface so we can restore
         // it precisely on disconnect — avoids the "hardcode en0" problem.
@@ -457,10 +486,23 @@ impl Tunnel {
         } else {
             debug!("ip route add {} failed (may already exist)", self.config.vpn_network_config()?.cidr_string());
         }
-        
+
+        // Apply included routes (extra subnets via VPN in split-tunnel mode)
+        if !self.config.full_tunnel {
+            for cidr in self.config.included_routes.clone() {
+                let ok = Command::new("ip")
+                    .args(["route", "replace", &cidr, "dev", tun_name])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok { info!("Added included route {} via {}", cidr, tun_name); }
+                else  { error!("Failed to add included route {}", cidr); }
+            }
+        }
+
         Ok(())
     }
-    
+
     // ──────────────────── Windows ────────────────────
 
     /// Discover the wintun adapter's interface index via `netsh`.
@@ -516,10 +558,31 @@ impl Tunnel {
             &format!("Added route {}/{} via {} IF {} (Windows)", network_addr, self.config.prefix_len, peer_addr, self.wintun_if_index.as_deref().unwrap_or("auto")),
             &format!("VPN subnet route {}/{}", network_addr, self.config.prefix_len),
         )?;
-        
+
+        // Apply included routes (extra subnets via VPN in split-tunnel mode)
+        if !self.config.full_tunnel {
+            for cidr in self.config.included_routes.clone() {
+                let parts: Vec<&str> = cidr.split('/').collect();
+                if parts.len() == 2 {
+                    if let Ok(prefix) = parts[1].parse::<u8>() {
+                        let net = parts[0];
+                        let mask = prefix_to_netmask(prefix);
+                        let (add, del): (Vec<&str>, Vec<&str>) = if let Some(ref idx) = self.wintun_if_index {
+                            (vec!["add", net, "mask", mask.as_str(), peer_addr, "IF", idx], vec!["delete", net, "mask", mask.as_str()])
+                        } else {
+                            (vec!["add", net, "mask", mask.as_str(), peer_addr], vec!["delete", net, "mask", mask.as_str()])
+                        };
+                        let _ = self.add_windows_route_with_retry(&add, &del,
+                            &format!("Added included route {}", cidr),
+                            &format!("included route {}", cidr));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
-    
+
     /// Set VPN server IP (call before enable_full_tunnel)
     pub fn set_server_ip(&mut self, server_ip: String) {
         self.server_ip = Some(server_ip);
@@ -587,10 +650,22 @@ impl Tunnel {
             }
         }
         
+        // Apply excluded routes — send via original gateway, bypassing VPN
+        for cidr in self.config.excluded_routes.clone() {
+            let _ = Command::new("route").args(["-n", "delete", "-net", &cidr]).status();
+            let ok = Command::new("route")
+                .args(["-n", "add", "-net", &cidr, &gw])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok { info!("Excluded route {} via original gateway {}", cidr, gw); }
+            else  { error!("Failed to exclude route {}", cidr); }
+        }
+
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
-    
+
     /// Enable full-tunnel mode on Linux
     #[cfg(target_os = "linux")]
     pub fn enable_full_tunnel(&mut self) -> Result<()> {
@@ -711,10 +786,21 @@ impl Tunnel {
             }
         }
         
+        // Apply excluded routes — send via original gateway, bypassing VPN
+        for cidr in self.config.excluded_routes.clone() {
+            let ok = Command::new("ip")
+                .args(["route", "replace", &cidr, "via", &gw, "dev", &default_dev])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok { info!("Excluded route {} via original gateway {}", cidr, gw); }
+            else  { error!("Failed to exclude route {}", cidr); }
+        }
+
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
-    
+
     /// Enable full-tunnel mode on Windows
     #[cfg(target_os = "windows")]
     pub fn enable_full_tunnel(&mut self) -> Result<()> {
@@ -777,36 +863,57 @@ impl Tunnel {
             )?;
         }
         
+        // Apply excluded routes — send via original gateway, bypassing VPN
+        for cidr in self.config.excluded_routes.clone() {
+            let parts: Vec<&str> = cidr.split('/').collect();
+            if parts.len() == 2 {
+                if let Ok(prefix) = parts[1].parse::<u8>() {
+                    let net = parts[0];
+                    let mask = prefix_to_netmask(prefix);
+                    let add = ["add", net, "mask", mask.as_str(), gw.as_str()];
+                    let del = ["delete", net, "mask", mask.as_str()];
+                    let _ = self.add_windows_route_with_retry(&add, &del,
+                        &format!("Excluded route {} via original gateway {}", cidr, gw),
+                        &format!("excluded route {}", cidr));
+                }
+            }
+        }
+
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
-    
+
     /// Disable full-tunnel mode: restore original routing
     #[cfg(target_os = "macos")]
     fn disable_full_tunnel(&mut self) {
         use std::process::Command;
-        
+
         for net in ["0.0.0.0/1", "128.0.0.0/1"] {
             let _ = Command::new("route").args(["-n", "delete", "-net", net]).status();
         }
         if let Some(ref server_ip) = self.server_ip {
             let _ = Command::new("route").args(["-n", "delete", "-host", server_ip]).status();
         }
+        for cidr in self.config.excluded_routes.clone() {
+            let _ = Command::new("route").args(["-n", "delete", "-net", &cidr]).status();
+        }
         info!("Full tunnel routes removed");
     }
-    
+
     /// Disable full-tunnel mode on Linux
     #[cfg(target_os = "linux")]
     fn disable_full_tunnel(&mut self) {
         use std::process::Command;
-        
+
         for net in ["0.0.0.0/1", "128.0.0.0/1"] {
             let _ = Command::new("ip").args(["route", "del", net]).status();
         }
         if let Some(ref server_ip) = self.server_ip {
             let _ = Command::new("ip").args(["route", "del", server_ip]).status();
         }
-        // Restore default gateway
+        for cidr in self.config.excluded_routes.clone() {
+            let _ = Command::new("ip").args(["route", "del", &cidr]).status();
+        }
         if let Some(ref gw) = self.saved_default_gw {
             let _ = Command::new("ip").args(["route", "add", "default", "via", gw]).status();
         }
@@ -823,6 +930,15 @@ impl Tunnel {
         }
         if let Some(ref server_ip) = self.server_ip {
             let _ = Command::new("route").args(["delete", server_ip]).status();
+        }
+        for cidr in self.config.excluded_routes.clone() {
+            let parts: Vec<&str> = cidr.split('/').collect();
+            if parts.len() == 2 {
+                if let Ok(prefix) = parts[1].parse::<u8>() {
+                    let mask = prefix_to_netmask(prefix);
+                    let _ = Command::new("route").args(["delete", parts[0], "mask", &mask]).status();
+                }
+            }
         }
         info!("Full tunnel routes removed");
     }

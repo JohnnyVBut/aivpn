@@ -28,6 +28,8 @@ struct HelperRequest: Codable {
     let fullTunnel: Bool?    // full tunnel mode (for connect)
     let binaryPath: String?  // custom binary path (for connect/dev)
     let service: String?     // service name (for record_start)
+    let includedRoutes: [String]?  // extra subnets to route via VPN (split-tunnel)
+    let excludedRoutes: [String]?  // subnets to bypass VPN (full-tunnel)
 }
 
 struct HelperResponse: Codable {
@@ -146,7 +148,8 @@ func runCommand(_ path: String, args: [String]) -> Bool {
 }
 
 /// Start aivpn-client with the given configuration using posix_spawn
-func startClient(key: String, fullTunnel: Bool, binaryPath: String?) -> HelperResponse {
+func startClient(key: String, fullTunnel: Bool, binaryPath: String?,
+                 includedRoutes: [String]? = nil, excludedRoutes: [String]? = nil) -> HelperResponse {
     killExistingClient()
 
     let clientPath = binaryPath ?? DEFAULT_CLIENT_PATH
@@ -170,6 +173,14 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?) -> HelperRe
     var args: [String] = [clientPath, "-k", key]
     if fullTunnel {
         args.append("--full-tunnel")
+    }
+    if let included = includedRoutes, !included.isEmpty {
+        args.append("--included-routes")
+        args.append(included.joined(separator: ","))
+    }
+    if let excluded = excludedRoutes, !excluded.isEmpty {
+        args.append("--excluded-routes")
+        args.append(excluded.joined(separator: ","))
     }
 
     // Use posix_spawn for reliable process management
@@ -526,7 +537,9 @@ func handleConnection(_ clientFD: Int32) {
         }
         response = startClient(key: key,
                                fullTunnel: request.fullTunnel ?? false,
-                               binaryPath: request.binaryPath)
+                               binaryPath: request.binaryPath,
+                               includedRoutes: request.includedRoutes,
+                               excludedRoutes: request.excludedRoutes)
 
     case "disconnect":
         response = stopClient()

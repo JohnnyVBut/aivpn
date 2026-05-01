@@ -230,7 +230,11 @@ impl AivpnClient {
         let tun_name = self.config.tun_config.tun_name.clone();
         let full_tunnel = self.config.tun_config.full_tunnel;
         self.tunnel.apply_network_config(network_config)?;
-        self.config.tun_config = TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
+        self.config.tun_config = TunnelConfig::from_network_config(
+            tun_name, network_config, full_tunnel,
+            self.config.tun_config.included_routes.clone(),
+            self.config.tun_config.excluded_routes.clone(),
+        );
         Ok(())
     }
     
